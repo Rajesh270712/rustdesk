@@ -11,7 +11,7 @@ permissions:
 
 env:
   LLVM_VERSION: "15.0.6"
-  RUST_VERSION: "1.75"
+  RUST_VERSION: "stable"
   CPAL_REV: "6b374bcaed076750ca8fce6da518ab39b882e14a"
   FLEXASIO_VERSION: "1.10b"
   FLEXASIO_URL: "https://github.com/dechamps/FlexASIO/releases/download/flexasio-1.10b/FlexASIO-1.10b.exe"
