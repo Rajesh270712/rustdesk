@@ -81,8 +81,10 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $smokeRoot = Join-Path $env:RUNNER_TEMP "asio-runtime-smoke"
+          $installDir = Join-Path $env:ProgramFiles "FlexASIO"
           New-Item -ItemType Directory -Force -Path $smokeRoot | Out-Null
           "ASIO_SMOKE_ROOT=$smokeRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "FLEXASIO_INSTALL_DIR=$installDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
           $installer = Join-Path $smokeRoot "FlexASIO-${env:FLEXASIO_VERSION}.exe"
           $installLog = Join-Path $smokeRoot "FlexASIO-install.log"
@@ -100,12 +102,9 @@ jobs:
             throw "FlexASIO installer failed with exit code $($process.ExitCode)"
           }
 
-          $roots = @($env:ProgramFiles, ${env:ProgramFiles(x86)}) | Where-Object { $_ -and (Test-Path $_) }
           $toolNames = @("FlexASIOTest.exe", "PortAudioDevices.exe")
-          $tools = foreach ($root in $roots) {
-            foreach ($toolName in $toolNames) {
-              Get-ChildItem -Path $root -Recurse -Filter $toolName -ErrorAction SilentlyContinue
-            }
+          $tools = foreach ($toolName in $toolNames) {
+            Get-ChildItem -Path $installDir -Recurse -Filter $toolName -ErrorAction SilentlyContinue
           }
           $tools | Select-Object -ExpandProperty FullName | Tee-Object -FilePath (Join-Path $smokeRoot "FlexASIO-installed-tools.txt")
           if (!$tools) {
@@ -130,13 +129,9 @@ jobs:
           }
           Get-Service -Name $audioServices -ErrorAction SilentlyContinue | Format-Table -AutoSize | Out-String | Tee-Object -FilePath (Join-Path $smokeRoot "windows-audio-services.log")
 
-          $roots = @($env:ProgramFiles, ${env:ProgramFiles(x86)}) | Where-Object { $_ -and (Test-Path $_) }
-          $portAudioTools = foreach ($root in $roots) {
-            Get-ChildItem -Path $root -Recurse -Filter "PortAudioDevices.exe" -ErrorAction SilentlyContinue
-          }
-          $flexTests = foreach ($root in $roots) {
-            Get-ChildItem -Path $root -Recurse -Filter "FlexASIOTest.exe" -ErrorAction SilentlyContinue
-          }
+          $installDir = $env:FLEXASIO_INSTALL_DIR
+          $portAudioTools = Get-ChildItem -Path $installDir -Recurse -Filter "PortAudioDevices.exe" -ErrorAction SilentlyContinue
+          $flexTests = Get-ChildItem -Path $installDir -Recurse -Filter "FlexASIOTest.exe" -ErrorAction SilentlyContinue
 
           function Invoke-Tool {
             param(
