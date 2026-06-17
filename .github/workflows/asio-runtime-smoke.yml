@@ -37,6 +37,30 @@ jobs:
           toolchain: ${{ env.RUST_VERSION }}
           targets: x86_64-pc-windows-msvc
 
+      - name: Install VB-CABLE virtual audio endpoint
+        uses: AlekseyMartynov/action-vbcable-win@493778e043b66f79697ba1886547f473c8ff70ff
+
+      - name: List Windows audio endpoints after VB-CABLE
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          $smokeRoot = Join-Path $env:RUNNER_TEMP "asio-runtime-smoke"
+          New-Item -ItemType Directory -Force -Path $smokeRoot | Out-Null
+          Get-Service -Name AudioEndpointBuilder, Audiosrv -ErrorAction SilentlyContinue |
+            Format-Table -AutoSize |
+            Out-String |
+            Tee-Object -FilePath (Join-Path $smokeRoot "windows-audio-services-after-vbcable.log")
+          Get-CimInstance Win32_SoundDevice |
+            Select-Object Name, Status, Manufacturer, DeviceID |
+            Format-List |
+            Out-String |
+            Tee-Object -FilePath (Join-Path $smokeRoot "win32-sound-devices-after-vbcable.log")
+          Get-PnpDevice -Class Media -ErrorAction SilentlyContinue |
+            Select-Object Status, Class, FriendlyName, InstanceId |
+            Format-List |
+            Out-String |
+            Tee-Object -FilePath (Join-Path $smokeRoot "pnp-media-devices-after-vbcable.log")
+
       - name: Install Steinberg ASIO SDK
         shell: pwsh
         run: |
@@ -251,4 +275,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: flexasio-runtime-smoke-logs
-          path: ${{ runner.temp }}\asio-runtime-smoke\**
+          path: |
+            ${{ runner.temp }}\asio-runtime-smoke\*.log
+            ${{ runner.temp }}\asio-runtime-smoke\*.txt
+            ${{ runner.temp }}\asio-runtime-smoke\cpal-asio-smoke\Cargo.lock
+            ${{ runner.temp }}\asio-runtime-smoke\cpal-asio-smoke\Cargo.toml
+            ${{ runner.temp }}\asio-runtime-smoke\cpal-asio-smoke\src\**
