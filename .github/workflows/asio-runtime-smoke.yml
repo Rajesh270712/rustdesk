@@ -1,0 +1,247 @@
+name: ASIO Runtime Smoke
+
+on:
+  push:
+    branches:
+      - bountyops/BOU-553-flexasio-smoke
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  LLVM_VERSION: "15.0.6"
+  RUST_VERSION: "1.75"
+  CPAL_REV: "6b374bcaed076750ca8fce6da518ab39b882e14a"
+  FLEXASIO_VERSION: "1.10b"
+  FLEXASIO_URL: "https://github.com/dechamps/FlexASIO/releases/download/flexasio-1.10b/FlexASIO-1.10b.exe"
+
+jobs:
+  flexasio-windows-runtime:
+    name: FlexASIO runtime smoke on Windows
+    runs-on: windows-2022
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Install LLVM and Clang
+        uses: KyleMayes/install-llvm-action@v1
+        with:
+          version: ${{ env.LLVM_VERSION }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install Steinberg ASIO SDK
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $sdkRoot = Join-Path $env:RUNNER_TEMP "asio_sdk"
+          $extractRoot = Join-Path $env:RUNNER_TEMP "asio_sdk_extract"
+          $zipPath = Join-Path $env:RUNNER_TEMP "asio_sdk.zip"
+          Remove-Item -Recurse -Force $sdkRoot -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force $extractRoot -ErrorAction SilentlyContinue
+          Invoke-WebRequest -Uri "https://www.steinberg.net/asiosdk" -OutFile $zipPath
+          New-Item -ItemType Directory -Force -Path $extractRoot | Out-Null
+          Expand-Archive -Path $zipPath -DestinationPath $extractRoot -Force
+          $source = Get-ChildItem -Path $extractRoot -Directory | Where-Object {
+            (Test-Path (Join-Path $_.FullName "host")) -and
+            (Test-Path (Join-Path $_.FullName "host\pc")) -and
+            (Test-Path (Join-Path $_.FullName "common"))
+          } | Select-Object -First 1
+          if ($null -eq $source) {
+            Get-ChildItem -Path $extractRoot -Recurse -Depth 2 | Select-Object -ExpandProperty FullName
+            throw "Failed to find extracted ASIO SDK root"
+          }
+          Move-Item -Path $source.FullName -Destination $sdkRoot
+          $requiredPaths = @(
+            "host",
+            "host\pc",
+            "host\asiodrivers.h",
+            "common",
+            "common\asio.h",
+            "common\asiosys.h"
+          )
+          foreach ($relativePath in $requiredPaths) {
+            $path = Join-Path $sdkRoot $relativePath
+            if (!(Test-Path $path)) {
+              throw "ASIO SDK is missing required path: $relativePath"
+            }
+          }
+          "CPAL_ASIO_DIR=$sdkRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "CPAL_ASIO_DIR=$sdkRoot"
+
+      - name: Install FlexASIO
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $smokeRoot = Join-Path $env:RUNNER_TEMP "asio-runtime-smoke"
+          New-Item -ItemType Directory -Force -Path $smokeRoot | Out-Null
+          "ASIO_SMOKE_ROOT=$smokeRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          $installer = Join-Path $smokeRoot "FlexASIO-${env:FLEXASIO_VERSION}.exe"
+          $installLog = Join-Path $smokeRoot "FlexASIO-install.log"
+          Invoke-WebRequest -Uri $env:FLEXASIO_URL -OutFile $installer
+          Get-FileHash -Algorithm SHA256 -Path $installer | Format-List | Out-String | Tee-Object -FilePath (Join-Path $smokeRoot "FlexASIO-installer-sha256.txt")
+
+          $process = Start-Process -FilePath $installer -ArgumentList @(
+            "/VERYSILENT",
+            "/SUPPRESSMSGBOXES",
+            "/NORESTART",
+            "/LOG=$installLog"
+          ) -Wait -PassThru
+          if ($process.ExitCode -ne 0) {
+            if (Test-Path $installLog) { Get-Content $installLog }
+            throw "FlexASIO installer failed with exit code $($process.ExitCode)"
+          }
+
+          $roots = @($env:ProgramFiles, ${env:ProgramFiles(x86)}) | Where-Object { $_ -and (Test-Path $_) }
+          $toolNames = @("FlexASIOTest.exe", "PortAudioDevices.exe")
+          $tools = foreach ($root in $roots) {
+            foreach ($toolName in $toolNames) {
+              Get-ChildItem -Path $root -Recurse -Filter $toolName -ErrorAction SilentlyContinue
+            }
+          }
+          $tools | Select-Object -ExpandProperty FullName | Tee-Object -FilePath (Join-Path $smokeRoot "FlexASIO-installed-tools.txt")
+          if (!$tools) {
+            if (Test-Path $installLog) { Get-Content $installLog }
+            throw "FlexASIO installed successfully, but no diagnostic tools were found"
+          }
+
+      - name: Run FlexASIO diagnostics
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          $smokeRoot = $env:ASIO_SMOKE_ROOT
+          $flexLog = Join-Path $env:USERPROFILE "FlexASIO.log"
+          New-Item -ItemType File -Force -Path $flexLog | Out-Null
+
+          $audioServices = @("AudioEndpointBuilder", "Audiosrv")
+          foreach ($serviceName in $audioServices) {
+            $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+            if ($null -ne $service -and $service.Status -ne "Running") {
+              Start-Service -Name $serviceName -ErrorAction SilentlyContinue
+            }
+          }
+          Get-Service -Name $audioServices -ErrorAction SilentlyContinue | Format-Table -AutoSize | Out-String | Tee-Object -FilePath (Join-Path $smokeRoot "windows-audio-services.log")
+
+          $roots = @($env:ProgramFiles, ${env:ProgramFiles(x86)}) | Where-Object { $_ -and (Test-Path $_) }
+          $portAudioTools = foreach ($root in $roots) {
+            Get-ChildItem -Path $root -Recurse -Filter "PortAudioDevices.exe" -ErrorAction SilentlyContinue
+          }
+          $flexTests = foreach ($root in $roots) {
+            Get-ChildItem -Path $root -Recurse -Filter "FlexASIOTest.exe" -ErrorAction SilentlyContinue
+          }
+
+          function Invoke-Tool {
+            param(
+              [Parameter(Mandatory = $true)][string]$Path,
+              [Parameter(Mandatory = $true)][string]$LogPath
+            )
+            Write-Host "Running $Path"
+            & $Path *>&1 | Tee-Object -FilePath $LogPath
+            $exitCode = $LASTEXITCODE
+            "EXIT_CODE=$exitCode" | Tee-Object -FilePath $LogPath -Append
+            Write-Host "$Path exited with $exitCode"
+            return $exitCode
+          }
+
+          foreach ($tool in $portAudioTools) {
+            $arch = if ($tool.FullName -match "\\x86\\") { "x86" } else { "x64" }
+            Invoke-Tool -Path $tool.FullName -LogPath (Join-Path $smokeRoot "PortAudioDevices-$arch.log") | Out-Null
+          }
+
+          foreach ($tool in $flexTests) {
+            $arch = if ($tool.FullName -match "\\x86\\") { "x86" } else { "x64" }
+            Invoke-Tool -Path $tool.FullName -LogPath (Join-Path $smokeRoot "FlexASIOTest-$arch.log") | Out-Null
+          }
+
+          if (Test-Path $flexLog) {
+            Copy-Item -Path $flexLog -Destination (Join-Path $smokeRoot "FlexASIO.log") -Force
+            Get-Content $flexLog -Tail 200
+          }
+
+      - name: Build and run CPAL ASIO smoke
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $smokeRoot = $env:ASIO_SMOKE_ROOT
+          $project = Join-Path $smokeRoot "cpal-asio-smoke"
+          New-Item -ItemType Directory -Force -Path (Join-Path $project "src") | Out-Null
+
+          @"
+          [package]
+          name = "cpal-asio-smoke"
+          version = "0.1.0"
+          edition = "2021"
+
+          [dependencies]
+          cpal = { git = "https://github.com/rustdesk-org/cpal", rev = "$env:CPAL_REV", features = ["asio"] }
+          "@ | Set-Content -Path (Join-Path $project "Cargo.toml") -Encoding utf8
+
+          @'
+          use cpal::traits::{DeviceTrait, HostTrait};
+
+          fn main() -> Result<(), Box<dyn std::error::Error>> {
+              println!("CPAL_REV={}", env!("CPAL_REV"));
+              println!("CPAL_ASIO_DIR={}", std::env::var("CPAL_ASIO_DIR").unwrap_or_default());
+
+              let host = cpal::host_from_id(cpal::HostId::Asio)?;
+              println!("CPAL_ASIO_HOST=ok");
+
+              let mut device_count = 0usize;
+              let mut input_capable_count = 0usize;
+              let mut flexasio_visible = false;
+
+              for device in host.devices()? {
+                  device_count += 1;
+                  let name = device.name().unwrap_or_else(|err| format!("<name error: {err:?}>"));
+                  if name.contains("FlexASIO") {
+                      flexasio_visible = true;
+                  }
+                  println!("ASIO_DEVICE[{device_count}]={name}");
+
+                  match device.default_input_config() {
+                      Ok(config) => {
+                          input_capable_count += 1;
+                          println!("  default_input_config={config:?}");
+                          println!("  rustdesk_ui_label={name} (ASIO)");
+                      }
+                      Err(err) => println!("  default_input_config_error={err:?}"),
+                  }
+
+                  match device.default_output_config() {
+                      Ok(config) => println!("  default_output_config={config:?}"),
+                      Err(err) => println!("  default_output_config_error={err:?}"),
+                  }
+              }
+
+              println!("CPAL_ASIO_DEVICE_COUNT={device_count}");
+              println!("CPAL_ASIO_INPUT_CAPABLE_COUNT={input_capable_count}");
+              println!("FLEXASIO_VISIBLE={flexasio_visible}");
+
+              if !flexasio_visible {
+                  return Err("FlexASIO was not visible through CPAL's ASIO host".into());
+              }
+
+              Ok(())
+          }
+          '@ | Set-Content -Path (Join-Path $project "src/main.rs") -Encoding utf8
+
+          Push-Location $project
+          cargo generate-lockfile
+          $env:CPAL_REV = $env:CPAL_REV
+          cargo run --locked --target x86_64-pc-windows-msvc *>&1 | Tee-Object -FilePath (Join-Path $smokeRoot "cpal-asio-smoke.log")
+          Pop-Location
+
+      - name: Upload smoke logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: flexasio-runtime-smoke-logs
+          path: ${{ runner.temp }}\asio-runtime-smoke\**
